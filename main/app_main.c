@@ -29,6 +29,8 @@
 #include "lwip/netdb.h"
 
 #include "driver/adc.h"
+#include "driver/ledc.h"
+#include "driver/pcnt.h"
 
 #include "esp_log.h"
 #include "mqtt_client.h"
@@ -37,21 +39,41 @@ static const char *TAG = "MQTT_WEATHER";
 static const char *TOPIC = "weather";
 
 static esp_mqtt_client_handle_t mqtt_client;
-static esp_timer_handle_t timer;
 
+static const gpio_num_t LEDC_OUTPUT_IO = 18;
+
+static const pcnt_unit_t PCNT_UNIT = 0;
+static const int PCNT_INPUT_GPIO = 4;
+static const int16_t PCNT_H_LIM = 10000;
+static const int16_t PCNT_L_LIM = 0;
+
+static esp_timer_handle_t timer;
 static const uint64_t TIMER_PERIOD = 10000000;
 
 static const adc_bits_width_t adc_width = ADC_WIDTH_BIT_13;
-static const adc1_channel_t adc_channel = ADC1_CHANNEL_0;    // GPIO-1
+static const adc1_channel_t vane_adc_channel = ADC1_CHANNEL_0;    // GPIO-1
+static const adc1_channel_t temp_adc_channel = ADC1_CHANNEL_1;    // GPIO-2
 static const adc_atten_t adc_attenuation = ADC_ATTEN_DB_11;
 
 static void timer_callback(void *arg)
 {
-  uint32_t adc_reading = adc1_get_raw(adc_channel);
-  ESP_LOGI(TAG, "Timer callback: adc=%u", adc_reading);
+  uint32_t vane_adc_reading = adc1_get_raw(vane_adc_channel);
+  uint32_t temp_adc_reading = adc1_get_raw(temp_adc_channel);
+
+  int16_t pulses = 0;
+  esp_err_t status = pcnt_get_counter_value(PCNT_UNIT, &pulses);
+  pcnt_counter_pause(PCNT_UNIT);
+  pcnt_counter_clear(PCNT_UNIT);
+  pcnt_counter_resume(PCNT_UNIT);
+
+  ESP_LOGI(TAG, "Timer callback: vane_adc=%u, temp_adc=%u, pulse=%d, err=%u",
+           vane_adc_reading, temp_adc_reading, pulses, status);
 
   char outbuf[100];
-  snprintf(outbuf, sizeof(outbuf), "adc: %u", adc_reading);
+  snprintf(outbuf, sizeof(outbuf),
+           "{ \"vane_adc\": \"%u\", \"temp_adc\": \"%u\", \"anem_pulse\": \"%u\" }",
+           vane_adc_reading, temp_adc_reading, pulses);
+
   esp_mqtt_client_publish(mqtt_client, TOPIC, outbuf, 0, 1, 0);
 }
 
@@ -59,6 +81,9 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 {
     // your_context_t *context = event->context;
     switch (event->event_id) {
+        case MQTT_EVENT_BEFORE_CONNECT:
+            ESP_LOGI(TAG, "MQTT_EVENT_BEFORE_CONNECT");
+            break;
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
             break;
@@ -113,10 +138,78 @@ static void mqtt_app_start(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(timer, TIMER_PERIOD));
 }
 
+/* Configure LED PWM Controller
+ * to output sample pulses at 10 Hz with duty of about 10%
+ */
+static void configure_ledc(void)
+{
+    // Prepare and then apply the LEDC PWM timer configuration
+    ledc_timer_config_t ledc_timer;
+    ledc_timer.speed_mode       = LEDC_LOW_SPEED_MODE;
+    ledc_timer.timer_num        = LEDC_TIMER_1;
+    ledc_timer.duty_resolution  = LEDC_TIMER_10_BIT;
+    ledc_timer.freq_hz          = 10;  // set output frequency at 1 Hz
+    ledc_timer.clk_cfg = LEDC_AUTO_CLK;
+    ledc_timer_config(&ledc_timer);
+
+    // Prepare and then apply the LEDC PWM channel configuration
+    ledc_channel_config_t ledc_channel;
+    ledc_channel.speed_mode = LEDC_LOW_SPEED_MODE;
+    ledc_channel.channel    = LEDC_CHANNEL_1;
+    ledc_channel.timer_sel  = LEDC_TIMER_1;
+    ledc_channel.intr_type  = LEDC_INTR_DISABLE;
+    ledc_channel.gpio_num   = LEDC_OUTPUT_IO;
+    ledc_channel.duty       = 100; // set duty at about 10%
+    ledc_channel.hpoint     = 0;
+    ledc_channel_config(&ledc_channel);
+}
+
+/*
+ * Configure and initialize anemometer PCNT
+ *  - set up the input filter
+ */
+static void configure_anem_pcnt(void)
+{
+    /* Prepare configuration for the PCNT unit */
+    pcnt_config_t pcnt_config = {
+        // Set PCNT input signal and control GPIOs
+        .pulse_gpio_num = PCNT_INPUT_GPIO,
+        .ctrl_gpio_num = PCNT_PIN_NOT_USED,
+        .channel = PCNT_CHANNEL_0,
+        .unit = PCNT_UNIT,
+        // What to do on the positive / negative edge of pulse input?
+        .pos_mode = PCNT_COUNT_INC,   // Count up on the positive edge
+        .neg_mode = PCNT_COUNT_DIS,   // Keep the counter value on the negative edge
+        // What to do when control input is low or high?
+        .lctrl_mode = PCNT_MODE_KEEP, // Reverse counting direction if low
+        .hctrl_mode = PCNT_MODE_KEEP,    // Keep the primary counter mode if high
+        // Set the maximum and minimum limit values to watch
+        .counter_h_lim = PCNT_H_LIM,
+        .counter_l_lim = PCNT_L_LIM,
+    };
+    /* Initialize PCNT unit */
+    esp_err_t config_err = pcnt_unit_config(&pcnt_config);
+    ESP_LOGI(TAG, "pcnt_unit_config err=%u", config_err);
+
+    /* Configure and enable the input filter */
+    pcnt_set_filter_value(PCNT_UNIT, 100);
+    pcnt_filter_enable(PCNT_UNIT);
+
+    /* Initialize PCNT's counter */
+    pcnt_counter_pause(PCNT_UNIT);
+    pcnt_counter_clear(PCNT_UNIT);
+
+    pcnt_intr_enable(PCNT_UNIT);
+
+    /* Everything is set up, now go to counting */
+    pcnt_counter_resume(PCNT_UNIT);
+}
+
 static void configure_adc(void)
 {
   adc1_config_width(adc_width);
-  adc1_config_channel_atten(adc_channel, adc_attenuation);
+  adc1_config_channel_atten(vane_adc_channel, adc_attenuation);
+  adc1_config_channel_atten(temp_adc_channel, adc_attenuation);
 }
 
 void app_main(void)
@@ -138,6 +231,8 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     configure_adc();
+    configure_ledc();
+    configure_anem_pcnt();
 
     /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
      * Read "Establishing Wi-Fi or Ethernet Connection" section in
